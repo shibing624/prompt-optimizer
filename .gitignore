@@ -6,6 +6,10 @@ __pycache__/
 *.pyc
 *.pyo
 
+# 数据文件（根目录）
+/data.csv
+/data*.csv
+
 # 实验产物
 research_log_*.md
 results.tsv
