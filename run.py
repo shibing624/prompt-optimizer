@@ -1,27 +1,32 @@
 import os
 import csv
 import random
+import time
+import subprocess
 import openai
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from sklearn.metrics import accuracy_score
+from datetime import datetime
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from loguru import logger
 from tqdm import tqdm
 from prepare import (
     WORKER_API_KEY, WORKER_BASE_URL, WORKER_MODEL_NAME, WORKER_THINKING,
     MASTER_API_KEY, MASTER_BASE_URL, MASTER_MODEL_NAME, MASTER_THINKING,
     ITERATIONS, SAMPLE_SIZE, CONCURRENCY,
-    VAL_RATIO, PATIENCE,
-    DATA_FILE, PROMPT_FILE, LOG_FILE,
+    VAL_RATIO, PATIENCE, VOTE_COUNT, PRIMARY_METRIC, MAX_RETRIES,
+    TEXT_COLUMN, LABEL_COLUMN, LABEL_MAP, LABEL_DESCRIPTIONS,
+    DATA_FILE, PROMPT_FILE, LOG_FILE, RESULTS_FILE,
+    parse_args, apply_args,
 )
 
-# Worker: 执行分类任务（temperature=0）
 worker_client = openai.OpenAI(api_key=WORKER_API_KEY, base_url=WORKER_BASE_URL)
-# Master: 错误分析 + prompt 改写（temperature=0.7，更大模型）
 master_client = openai.OpenAI(api_key=MASTER_API_KEY, base_url=MASTER_BASE_URL)
 
 
 # ====== 数据与文件加载 ======
 def load_data(path):
+    """加载 CSV 标注数据，自动适配 TEXT_COLUMN / LABEL_COLUMN / LABEL_MAP"""
     data = []
     if not os.path.exists(path):
         logger.warning(f"{path} not found. Returning empty dataset.")
@@ -30,11 +35,11 @@ def load_data(path):
     with open(path, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            text = row.get("question", "").strip()
-            label_str = row.get("是否事实", "").strip()
+            text = row.get(TEXT_COLUMN, "").strip()
+            label_str = row.get(LABEL_COLUMN, "").strip()
             if not text:
                 continue
-            label = "1" if label_str == "事实" else "0"
+            label = LABEL_MAP.get(label_str, "0")
             data.append({"text": text, "label": label})
     return data
 
@@ -52,7 +57,8 @@ def split_train_val(data, val_ratio):
 
 def read_prompt(path):
     if not os.path.exists(path):
-        base_prompt = "你是「事实类问题判定专家」。你要判断用户 query 是否属于「事实类问题」，仅输出 1 或 0。\n\n用户query如下：\n{{query}}"
+        label_desc = "、".join([f"{v}({k})" for k, v in LABEL_DESCRIPTIONS.items()])
+        base_prompt = f"你是分类专家。判断用户输入属于哪个类别，仅输出类别标签（{label_desc}）。\n\n用户输入如下：\n{{{{query}}}}"
         write_prompt(path, base_prompt)
         return base_prompt
     with open(path, "r", encoding="utf-8") as f:
@@ -64,70 +70,129 @@ def write_prompt(path, prompt):
         f.write(prompt)
 
 
-def append_to_log(path, step, prompt, train_score, val_score, analysis):
+def append_to_log(path, step, prompt, metrics, analysis):
     with open(path, "a", encoding="utf-8") as f:
+        metrics_str = " | ".join([f"**{k}:** {v:.4f}" for k, v in metrics.items()])
         f.write(f"## Step {step}\n")
-        f.write(f"**Train Score:** {train_score:.4f} | **Val Score:** {val_score:.4f}\n\n")
+        f.write(f"{metrics_str}\n\n")
         f.write(f"**Prompt ({len(prompt.splitlines())} lines):**\n```markdown\n{prompt}\n```\n\n")
         f.write(f"**Error Analysis:**\n{analysis}\n\n")
         f.write("---\n\n")
 
 
-# ====== 调用 LLM ======
+def append_to_results(path, step, metrics_train, metrics_val, prompt_lines, status, description=""):
+    """追加结构化实验结果到 results.tsv"""
+    file_exists = os.path.exists(path) and os.path.getsize(path) > 0
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, delimiter="\t")
+        if not file_exists:
+            writer.writerow(["step", "train_accuracy", "train_f1", "val_accuracy", "val_f1",
+                             "prompt_lines", "status", "timestamp", "description"])
+        writer.writerow([
+            step,
+            f"{metrics_train.get('accuracy', 0):.4f}",
+            f"{metrics_train.get('f1', 0):.4f}",
+            f"{metrics_val.get('accuracy', 0):.4f}",
+            f"{metrics_val.get('f1', 0):.4f}",
+            prompt_lines,
+            status,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            description,
+        ])
+
+
+# ====== Git 集成 ======
+def git_commit(step, val_score, status):
+    """每轮自动 git commit prompt 文件"""
+    try:
+        subprocess.run(["git", "add", PROMPT_FILE, RESULTS_FILE], capture_output=True, check=True)
+        msg = f"step {step}: val_{PRIMARY_METRIC}={val_score:.4f} ({status})"
+        subprocess.run(["git", "commit", "-m", msg], capture_output=True, check=True)
+        logger.info(f"Git commit: {msg}")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+
+# ====== 调用 LLM（带重试） ======
 def _build_extra_body(thinking_type):
-    """thinking_type 为 enabled/auto 时返回 extra_body，disabled 时返回空 dict"""
     if thinking_type in ("enabled", "auto"):
         return {"extra_body": {"thinking": {"type": thinking_type}}}
     return {}
 
 
 def llm_worker(prompt, temperature=0.0):
-    try:
-        resp = worker_client.chat.completions.create(
-            model=WORKER_MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            **_build_extra_body(WORKER_THINKING),
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        logger.error(f"Worker LLM API Error: {e}")
-        return ""
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = worker_client.chat.completions.create(
+                model=WORKER_MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                **_build_extra_body(WORKER_THINKING),
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                wait = 2 ** attempt
+                logger.warning(f"Worker LLM retry {attempt + 1}/{MAX_RETRIES} after {wait}s: {e}")
+                time.sleep(wait)
+            else:
+                logger.error(f"Worker LLM API Error (all retries failed): {e}")
+                return ""
 
 
 def llm_master(prompt, temperature=0.7):
-    try:
-        resp = master_client.chat.completions.create(
-            model=MASTER_MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            **_build_extra_body(MASTER_THINKING),
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        logger.error(f"Master LLM API Error: {e}")
-        return ""
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = master_client.chat.completions.create(
+                model=MASTER_MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                **_build_extra_body(MASTER_THINKING),
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                wait = 2 ** attempt
+                logger.warning(f"Master LLM retry {attempt + 1}/{MAX_RETRIES} after {wait}s: {e}")
+                time.sleep(wait)
+            else:
+                logger.error(f"Master LLM API Error (all retries failed): {e}")
+                return ""
 
 
-# ====== 运行分类（并发，使用 worker） ======
+# ====== 运行分类（并发 + 多数投票） ======
+def _parse_prediction(out):
+    """从 LLM 输出中解析预测标签"""
+    out_clean = out.strip()
+    all_labels = set(LABEL_MAP.values())
+    found = [lb for lb in all_labels if lb in out_clean]
+    if len(found) == 1:
+        return found[0]
+    if out_clean and out_clean[-1] in all_labels:
+        return out_clean[-1]
+    return "0"
+
+
 def _classify_single(idx, item, prompt):
     text = item["text"]
     if "{{query}}" in prompt:
         query = prompt.replace("{{query}}", text)
     else:
-        query = f"{prompt}\n\n用户query如下：\n{text}"
+        query = f"{prompt}\n\n用户输入如下：\n{text}"
 
-    query += "\n\n请直接输出1或0，不需要任何解释。"
+    all_labels = set(LABEL_MAP.values())
+    label_str = "/".join(sorted(all_labels))
+    query += f"\n\n请直接输出{label_str}，不需要任何解释。"
 
-    out = llm_worker(query, temperature=0.0)
-
-    out_clean = out.strip()
-    if "1" in out_clean and "0" not in out_clean:
-        pred = "1"
-    elif "0" in out_clean and "1" not in out_clean:
-        pred = "0"
+    if VOTE_COUNT <= 1:
+        out = llm_worker(query, temperature=0.0)
+        pred = _parse_prediction(out)
     else:
-        pred = out_clean[-1] if out_clean and out_clean[-1] in ("0", "1") else "0"
+        votes = []
+        for _ in range(VOTE_COUNT):
+            out = llm_worker(query, temperature=0.3)
+            votes.append(_parse_prediction(out))
+        pred = Counter(votes).most_common(1)[0][0]
 
     return idx, text, pred, item["label"]
 
@@ -153,12 +218,20 @@ def run_prompt(prompt, dataset, desc="Classification"):
     return preds
 
 
-# ====== 评估与错误收集 ======
+# ====== 多指标评估 ======
 def evaluate(preds, dataset):
+    """返回 (metrics_dict, errors_list)"""
     if not dataset:
-        return 0.0, []
+        return {}, []
     gt = [x["label"] for x in dataset]
-    score = accuracy_score(gt, preds)
+
+    all_labels = sorted(set(LABEL_MAP.values()))
+    metrics = {
+        "accuracy": accuracy_score(gt, preds),
+        "f1": f1_score(gt, preds, labels=all_labels, average="macro", zero_division=0),
+        "precision": precision_score(gt, preds, labels=all_labels, average="macro", zero_division=0),
+        "recall": recall_score(gt, preds, labels=all_labels, average="macro", zero_division=0),
+    }
 
     errors = []
     for i, (p, g) in enumerate(zip(preds, gt)):
@@ -168,18 +241,25 @@ def evaluate(preds, dataset):
                 "expected": g,
                 "predicted": p,
             })
-    return score, errors
+    return metrics, errors
 
 
-# ====== 自动化错误分析 (Error Analysis Agent, 使用 master) ======
-def analyze_errors(prompt, errors):
-    if not errors:
+# ====== 错误分析（加权采样：优先 val 错误） ======
+def analyze_errors(prompt, val_errors, train_errors):
+    if not val_errors and not train_errors:
         return "No errors found."
 
-    error_sample = random.sample(errors, min(len(errors), 5))
+    # 优先采样 val 错误（泛化能力更重要），再补充 train 错误
+    val_sample = random.sample(val_errors, min(len(val_errors), 4))
+    remaining = 6 - len(val_sample)
+    train_sample = random.sample(train_errors, min(len(train_errors), remaining)) if remaining > 0 else []
+    error_sample = val_sample + train_sample
+
+    label_desc_str = ", ".join([f"{k}: {v}" for k, v in LABEL_DESCRIPTIONS.items()])
     error_str = ""
     for e in error_sample:
-        error_str += f"Text: {e['text']}\nExpected Label: {e['expected']} (1: 事实, 0: 非事实)\nPredicted Label: {e['predicted']}\n\n"
+        src = "val" if e in val_sample else "train"
+        error_str += f"[{src}] Text: {e['text']}\nExpected: {e['expected']} ({label_desc_str})\nPredicted: {e['predicted']}\n\n"
 
     query = f"""你是一个AI分类错误分析专家。
 分析当前 prompt 在以下错误样本上失败的原因。
@@ -187,7 +267,7 @@ def analyze_errors(prompt, errors):
 当前 Prompt:
 {prompt}
 
-错误样本:
+错误样本（标注了来源 val/train，val 错误更重要）:
 {error_str}
 
 请分析：
@@ -200,15 +280,20 @@ def analyze_errors(prompt, errors):
     return llm_master(query).strip()
 
 
-# ====== prompt 改写（使用 master，增量修改策略） ======
-def improve_prompt(prompt, train_score, val_score, analysis, history):
+# ====== prompt 改写 ======
+def improve_prompt(prompt, metrics_train, metrics_val, analysis, history):
     history_str = ""
     for h in history[-3:]:
-        history_str += f"- Step {h['step']}: Train={h['train_score']:.4f}, Val={h['val_score']:.4f}\n  Analysis: {h['analysis'][:300]}...\n\n"
+        history_str += (f"- Step {h['step']}: Train={h['train_metrics'].get(PRIMARY_METRIC, 0):.4f}, "
+                        f"Val={h['val_metrics'].get(PRIMARY_METRIC, 0):.4f}\n"
+                        f"  Analysis: {h['analysis'][:300]}...\n\n")
+
+    label_desc_str = ", ".join([f"{k}: {v}" for k, v in LABEL_DESCRIPTIONS.items()])
+    all_labels = "/".join(sorted(LABEL_MAP.values()))
 
     query = f"""你是一个专业的 prompt 工程师。你的目标是在当前 prompt 基础上做**增量改进**，提升分类准确率。
 
-任务背景：1 表示"事实类问题"，0 表示"非事实类问题"。
+任务背景：标签含义 — {label_desc_str}。模型仅输出 {all_labels}。
 
 近几轮实验历史（注意 Train vs Val 的差距，差距大说明过拟合）：
 {history_str}
@@ -216,7 +301,7 @@ def improve_prompt(prompt, train_score, val_score, analysis, history):
 当前 Prompt（需改进）：
 {prompt}
 
-当前分数：Train={train_score:.4f}, Val={val_score:.4f}
+当前分数：Train {PRIMARY_METRIC}={metrics_train.get(PRIMARY_METRIC, 0):.4f}, Val {PRIMARY_METRIC}={metrics_val.get(PRIMARY_METRIC, 0):.4f}
 
 最新错误分析：
 {analysis}
@@ -249,13 +334,16 @@ def improve_prompt(prompt, train_score, val_score, analysis, history):
             new_prompt = new_prompt[:-3].strip()
 
     if "{{query}}" not in new_prompt:
-        new_prompt += "\n\n---\n用户query如下：\n{{query}}"
+        new_prompt += "\n\n---\n用户输入如下：\n{{query}}"
 
     return new_prompt
 
 
 # ====== 优化循环 ======
 def optimize():
+    args = parse_args()
+    apply_args(args)
+
     data = load_data(DATA_FILE)
     if not data:
         logger.error("No data available to run optimization.")
@@ -263,9 +351,8 @@ def optimize():
 
     train_set, val_set = split_train_val(data, VAL_RATIO)
 
-    # 备份旧日志（如果存在且有内容）
+    # 备份旧日志
     if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 0:
-        from datetime import datetime
         backup_name = LOG_FILE.replace(".md", f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md")
         os.rename(LOG_FILE, backup_name)
         logger.info(f"旧日志已备份为: {backup_name}")
@@ -279,73 +366,81 @@ def optimize():
     no_improve_count = 0
     history = []
 
+    logger.info(f"配置: iterations={ITERATIONS}, patience={PATIENCE}, metric={PRIMARY_METRIC}, "
+                f"vote_count={VOTE_COUNT}, val_ratio={VAL_RATIO}")
+
     for step in range(ITERATIONS):
         logger.info(f"--- Step {step}/{ITERATIONS} ---")
 
-        # 从 train 集抽样评估 + 收集错误
         train_sample = random.sample(train_set, min(len(train_set), SAMPLE_SIZE))
         train_preds = run_prompt(current_prompt, train_sample, desc=f"Step{step} Train")
-        train_score, train_errors = evaluate(train_preds, train_sample)
+        metrics_train, train_errors = evaluate(train_preds, train_sample)
 
-        # 在完整 val 集上评估（不抽样，确保稳定性）
         val_preds = run_prompt(current_prompt, val_set, desc=f"Step{step} Val")
-        val_score, val_errors = evaluate(val_preds, val_set)
+        metrics_val, val_errors = evaluate(val_preds, val_set)
 
-        logger.info(f"Train Score: {train_score:.4f} | Val Score: {val_score:.4f} | Prompt Lines: {len(current_prompt.splitlines())}")
+        val_primary = metrics_val.get(PRIMARY_METRIC, 0)
+        train_primary = metrics_train.get(PRIMARY_METRIC, 0)
+        metrics_str = " | ".join([f"{k}: T={metrics_train[k]:.4f}/V={metrics_val[k]:.4f}" for k in metrics_val])
+        logger.info(f"{metrics_str} | Prompt Lines: {len(current_prompt.splitlines())}")
 
-        # 只有 val score 提升才保存为 best
-        if val_score > best_val_score:
-            best_val_score = val_score
+        if val_primary > best_val_score:
+            best_val_score = val_primary
             best_prompt = current_prompt
             no_improve_count = 0
-            logger.info(f"Val score improved! Best val score: {best_val_score:.4f}")
+            status = "keep"
+            logger.info(f"Val {PRIMARY_METRIC} improved! Best: {best_val_score:.4f}")
         else:
             no_improve_count += 1
-            logger.warning(f"Val score not improved ({no_improve_count}/{PATIENCE}). Best: {best_val_score:.4f}")
-            # 回滚到 best prompt，下一轮在 best 基础上改进
+            status = "discard"
+            logger.warning(f"Val {PRIMARY_METRIC} not improved ({no_improve_count}/{PATIENCE}). Best: {best_val_score:.4f}")
             current_prompt = best_prompt
-            logger.info("Rolled back to best prompt for next iteration.")
+            logger.info("Rolled back to best prompt.")
 
-        if val_score == 1.0 and train_score == 1.0:
-            logger.info("Perfect score on both train and val. Stopping.")
-            append_to_log(LOG_FILE, step, current_prompt, train_score, val_score, "Perfect score reached.")
+        append_to_results(RESULTS_FILE, step, metrics_train, metrics_val,
+                          len(current_prompt.splitlines()), status)
+        git_commit(step, val_primary, status)
+
+        if val_primary == 1.0 and train_primary == 1.0:
+            logger.info("Perfect score. Stopping.")
+            append_to_log(LOG_FILE, step, current_prompt, metrics_val, "Perfect score reached.")
             break
 
-        # Early stopping
         if no_improve_count >= PATIENCE:
-            logger.warning(f"Early stopping: val score 连续 {PATIENCE} 轮未提升。回滚到 best prompt。")
+            logger.warning(f"Early stopping: val {PRIMARY_METRIC} 连续 {PATIENCE} 轮未提升。")
             write_prompt(PROMPT_FILE, best_prompt)
-            append_to_log(LOG_FILE, step, current_prompt, train_score, val_score,
-                          f"Early stop. Rolled back to best prompt (val={best_val_score:.4f}).")
+            append_to_log(LOG_FILE, step, current_prompt, metrics_val,
+                          f"Early stop. Best val {PRIMARY_METRIC}={best_val_score:.4f}.")
+            append_to_results(RESULTS_FILE, step, metrics_train, metrics_val,
+                              len(best_prompt.splitlines()), "early_stop", "rolled back to best")
+            git_commit(step, best_val_score, "early_stop")
             break
 
-        # 合并 train 和 val 的错误用于分析（优先 val 错误，因为代表泛化能力）
-        all_errors = val_errors + train_errors
-        logger.info(f"Analyzing errors (train_errors={len(train_errors)}, val_errors={len(val_errors)})...")
-        analysis = analyze_errors(current_prompt, all_errors)
+        logger.info(f"Analyzing errors (train={len(train_errors)}, val={len(val_errors)})...")
+        analysis = analyze_errors(current_prompt, val_errors, train_errors)
 
-        append_to_log(LOG_FILE, step, current_prompt, train_score, val_score, analysis)
+        append_to_log(LOG_FILE, step, current_prompt, metrics_val, analysis)
 
         history.append({
             "step": step,
             "prompt": current_prompt,
-            "train_score": train_score,
-            "val_score": val_score,
+            "train_metrics": metrics_train,
+            "val_metrics": metrics_val,
             "analysis": analysis,
         })
 
         logger.info("Generating new prompt (Master)...")
-        new_prompt = improve_prompt(current_prompt, train_score, val_score, analysis, history)
+        new_prompt = improve_prompt(current_prompt, metrics_train, metrics_val, analysis, history)
 
         write_prompt(PROMPT_FILE, new_prompt)
         current_prompt = new_prompt
         logger.info(f"New prompt written to {PROMPT_FILE} ({len(new_prompt.splitlines())} lines)")
 
     logger.info("=== OPTIMIZATION COMPLETE ===")
-    logger.info(f"BEST VAL SCORE: {best_val_score:.4f}")
+    logger.info(f"BEST VAL {PRIMARY_METRIC.upper()}: {best_val_score:.4f}")
     write_prompt(PROMPT_FILE, best_prompt)
     logger.info(f"Best prompt saved to {PROMPT_FILE}")
-    logger.info(f"Check {LOG_FILE} for the full experiment history.")
+    logger.info(f"Experiment log: {LOG_FILE} | Results: {RESULTS_FILE}")
 
 
 if __name__ == "__main__":

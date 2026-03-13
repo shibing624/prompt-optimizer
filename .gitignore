@@ -1,11 +1,15 @@
 # 环境变量
 .env
 
-
 # Python
 __pycache__/
 *.pyc
 *.pyo
+
+# 实验产物
+research_log_*.md
+results.tsv
+*_pred.csv
 
 # IDE
 .vscode/
