@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+@author:XuMing(xuming624@qq.com)
+@description: Agent-based prompt optimization for RAG evaluation
+
+Main entry point.
+"""
 import os
 import csv
 import random

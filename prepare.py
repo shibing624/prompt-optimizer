@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+@author:XuMing(xuming624@qq.com)
+@description: prepare for prompt optimization
+
+HUMAN update module
+"""
 import os
 import argparse
 from dotenv import load_dotenv
